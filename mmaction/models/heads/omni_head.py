@@ -1,0 +1,93 @@
+
+from typing import Tuple, Union
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from mmaction.evaluation import top_k_accuracy
+from mmaction.registry import MODELS
+from mmaction.utils import ConfigType, SampleList
+from .base import BaseHead
+
+
+@MODELS.register_module()
+class OmniHead(BaseHead):
+    
+
+    def __init__(self,
+                 image_classes: int,
+                 video_classes: int,
+                 in_channels: int,
+                 loss_cls: ConfigType = dict(type='CrossEntropyLoss'),
+                 image_dropout_ratio: float = 0.2,
+                 video_dropout_ratio: float = 0.5,
+                 video_nl_head: bool = True,
+                 **kwargs) -> None:
+        super().__init__(image_classes, in_channels, loss_cls, **kwargs)
+
+        self.fc2d = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.BatchNorm1d(in_channels),
+            nn.Dropout(image_dropout_ratio),
+            nn.Linear(in_channels, image_classes))
+
+        if video_nl_head:
+            self.fc3d = nn.Sequential(
+                nn.AdaptiveAvgPool3d(1), nn.Flatten(),
+                nn.Linear(in_channels, video_classes * 2),
+                nn.BatchNorm1d(video_classes * 2), nn.ReLU(inplace=True),
+                nn.Dropout(video_dropout_ratio),
+                nn.Linear(video_classes * 2, video_classes))
+        else:
+            self.fc3d = nn.Sequential(
+                nn.AdaptiveAvgPool3d(1), nn.Flatten(),
+                nn.BatchNorm1d(in_channels), nn.Dropout(video_dropout_ratio),
+                nn.Linear(in_channels, video_classes))
+
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
+        
+        if len(x.shape) == 4:
+            cls_score = self.fc2d(x)
+        else:
+            cls_score = self.fc3d(x)
+        return cls_score
+
+    def loss_by_feat(self, cls_scores: Union[Tensor, Tuple[Tensor]],
+                     data_samples: SampleList) -> dict:
+        
+        if hasattr(data_samples[0], 'gt_labels'):
+            labels = [x.gt_labels.item for x in data_samples]
+        else:
+            labels = [x.gt_label.label for x in data_samples]
+        labels = torch.stack(labels).to(cls_scores.device)
+        labels = labels.squeeze()
+
+        losses = dict()
+        if labels.shape == torch.Size([]):
+            labels = labels.unsqueeze(0)
+        elif labels.dim() == 1 and cls_scores.size()[0] == 1:
+
+
+
+            labels = labels.unsqueeze(0)
+
+        if cls_scores.size() != labels.size():
+            top_k_acc = top_k_accuracy(cls_scores.detach().cpu().numpy(),
+                                       labels.detach().cpu().numpy(),
+                                       self.topk)
+            for k, a in zip(self.topk, top_k_acc):
+                losses[f'top{k}_acc'] = torch.tensor(
+                    a, device=cls_scores.device)
+        if self.label_smooth_eps != 0:
+            if cls_scores.size() != labels.size():
+                labels = F.one_hot(labels, num_classes=self.num_classes)
+            labels = ((1 - self.label_smooth_eps) * labels +
+                      self.label_smooth_eps / self.num_classes)
+
+        loss_cls = self.loss_cls(cls_scores, labels)
+
+        if isinstance(loss_cls, dict):
+            losses.update(loss_cls)
+        else:
+            losses['loss_cls'] = loss_cls
+        return losses
